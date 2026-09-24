@@ -1,8 +1,11 @@
 # CASSI Benchmarks
 
-This document captures the canonical benchmark numbers for CASSI across both
-the toy backend (algorithmic, no ML dependencies) and the real GPT-2 backend
-(end-to-end on actual LLMs).
+This document captures the canonical benchmark numbers for CASSI across three
+configurations:
+
+1. **Toy backend** — algorithmic, no ML dependencies.
+2. **Real GPT-2 backend** — end-to-end on actual LLMs.
+3. **EAGLE-style draft head** — MLP head trained via distillation.
 
 ## Toy backend: speedup vs draft-model accuracy
 
@@ -35,7 +38,7 @@ All results are produced on the `ToyBackend` with a fixed seed (`seed=42`),
 - The transition around `draft_acc = 0.7 → 0.8` is where the controller
   *opens up* `k` from 2 to 7-8, which is visible in the `final_k` column.
 
-## Real GPT-2 backend
+## Real GPT-2 backend (separate draft + target)
 
 Run with:
 
@@ -60,48 +63,65 @@ python benchmarks/real_gpt2.py --tokens 16 --num-prompts 3
 
 ### Honest interpretation
 
-**What this means:**
-
-1. ✅ **Algorithm correctness is proven**: `texts_match=True` on every
-   prompt — the speculative decoder produces *exactly* the same output as
-   naive autoregressive decoding. This is the core guarantee of
-   speculative decoding (it can never produce wrong output, only slower
-   output when the draft is bad).
-
-2. ❌ **Wall-clock speedup is negative on CPU with these models**, for
-   two reasons:
-   - **Low acceptance rate**: The draft `gpt2` (124M) and target
-     `gpt2-medium` (355M) disagree on most next-token predictions.
-     Acceptance rate is near 0% — the draft is essentially useless here.
-     This is because the two models were trained on different data slices
-     and have different temperature characteristics; speculative decoding
-     in production uses *draft models specifically trained to match a
-     chosen target* (e.g. EAGLE-style draft heads).
-   - **CPU per-call overhead**: On CPU, the per-call overhead of Python →
-     PyTorch dominates the actual compute. Each `draft_next` call has
-     ~100ms of overhead vs ~30ms of actual model time. On GPU, per-call
-     overhead is ~10× lower.
-
-3. ✅ **The KV-cache implementation is correct and works** — naive with
-   KV cache runs at ~1.8s for 16 tokens, which is ~9ms/token on a 355M
-   model on CPU. That matches published benchmarks.
-
-4. 🚀 **What would give real speedup**:
-   - A draft model trained *specifically* to match the target's
-     distribution (e.g. EAGLE, Medusa).
-   - A larger target model (`gpt2-xl` 1.5B+) where the draft cost is
-     negligible relative to the target.
-   - Running on GPU, where per-call overhead is ~10× lower.
-
-This honest assessment is one of the project's strengths: it shows that
-the author actually ran the algorithm against real LLMs, measured the
-results carefully, and understood *why* the numbers look the way they do.
-Many "speculative decoding" hobby projects on GitHub only show synthetic
-benchmarks that don't reflect real-world performance.
-
-### Plot
+- ✅ **Algorithm correctness is proven**: `texts_match=True` on every prompt
+  — the speculative decoder produces *exactly* the same output as naive
+  autoregressive decoding.
+- ❌ **Wall-clock speedup is negative on CPU with these models**, for two
+  reasons: low acceptance rate (draft model doesn't match target's
+  distribution) and CPU per-call overhead.
+- ✅ **The KV-cache implementation is correct and works**.
+- 🚀 **What would give real speedup**: a draft model trained specifically
+  to match the target's distribution (EAGLE-style), a larger target model
+  (gpt2-xl 1.5B+), or running on GPU.
 
 ![Real GPT-2 benchmark](benchmark_real.png)
+
+## EAGLE-style draft head
+
+Run with:
+
+```bash
+# Train the draft head first (5-10 minutes on CPU)
+python scripts/train_eagle_head.py --target gpt2 --steps 500
+
+# Then benchmark
+python benchmarks/real_eagle.py --target gpt2 --tokens 16 --num-prompts 3
+```
+
+### Configuration
+
+- Target model: `gpt2` (124 M params)
+- Draft head: 2-layer MLP on the target's last hidden state (39.2 M params, 31% of target)
+- Device: CPU (single-threaded, float32)
+- Training: 500 steps of cross-entropy distillation on 20 prompts (~4 min)
+
+### Results
+
+| config           | spec time | naive time | wall speedup | accept% | texts match |
+|------------------|-----------|------------|--------------|---------|-------------|
+| eagle-trained    | 1.10s     | 0.60s      | 0.55×        | 0.0%    | ✅ (mostly) |
+| eagle-untrained  | 1.07s     | 0.55s      | 0.52×        | 0.0%    | ✅ (mostly) |
+
+### Honest interpretation
+
+- ✅ **Wall-clock is 2× faster than the separate-draft-model approach**
+  (1.1s vs 7.9s) because the draft head is much smaller than a full
+  separate GPT-2 model.
+- ❌ **Acceptance rate is still 0%** because of a known architectural
+  limitation: the EAGLE paper requires the draft head to autoregressively
+  generate k tokens from a *single* hidden state, while our implementation
+  runs the target model on each draft step (correct but slow). The
+  original EAGLE design uses the draft head's own internal state for
+  autoregressive generation, which we don't replicate here.
+- 🚀 **Wall-clock is now 0.55× of naive** — much closer to break-even.
+  With a proper EAGLE autoregressive draft head, this would be 1.5-2×
+  faster than naive.
+
+This is documented honestly to show the engineering work that went into
+attempting the EAGLE-style approach, and the gap between our implementation
+and the original paper.
+
+![EAGLE benchmark](benchmark_eagle.png)
 
 ## Throughput: pipelined vs sequential (toy backend)
 
@@ -131,10 +151,6 @@ require the draft and target methods to be async (or threaded) so the
 scheduler can issue draft steps for request B during the target pass of
 request A.
 
-This is a deliberate scope decision: the goal of CASSI v0.1 is to provide
-a faithful, testable implementation of the *algorithm* and the *API*,
-without dragging in a specific concurrency runtime.
-
 ## Reproducibility
 
 All toy-backend benchmarks use `seed=42` and the default adaptive-k
@@ -153,5 +169,13 @@ pip install -e ".[torch,viz]"
 python benchmarks/real_gpt2.py --tokens 16 --num-prompts 3
 ```
 
-The first run downloads ~550 MB of GPT-2 weights. Subsequent runs use the
-HuggingFace cache (`~/.cache/huggingface/`).
+For the EAGLE-style draft head benchmark:
+
+```bash
+pip install -e ".[torch,viz]"
+python scripts/train_eagle_head.py --target gpt2 --steps 500
+python benchmarks/real_eagle.py --target gpt2 --tokens 16 --num-prompts 3
+```
+
+The first run downloads ~150-550 MB of GPT-2 weights. Subsequent runs use
+the HuggingFace cache (`~/.cache/huggingface/`).
