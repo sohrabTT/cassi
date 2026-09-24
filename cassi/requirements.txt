@@ -1,0 +1,16 @@
+# CASSI has zero hard runtime dependencies on its own.
+# Optional backends and tooling install via extras:
+#   pip install -e ".[torch,viz,dev]"
+
+# Required for torch backend (optional)
+torch>=2.0.0
+transformers>=4.35.0
+
+# Required for plotting / benchmarks (optional)
+matplotlib>=3.7.0
+numpy>=1.24.0
+
+# Dev tooling
+pytest>=7.0
+pytest-cov>=4.0
+ruff>=0.1.0
